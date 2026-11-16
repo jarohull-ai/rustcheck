@@ -94,3 +94,13 @@ coarse filter, not a security boundary — the sandbox is the boundary.
 ## Licence
 
 MIT OR Apache-2.0
+
+## Licence
+
+MIT — see `LICENSE`. Only the MIT text is shipped, so the manifest does not
+claim the Apache-2.0 option that usually accompanies it.
+
+## Toolchain
+
+Built and tested only with `rustc 1.99.1` on x86_64 Linux. No `rust-version`
+(MSRV) is declared, because none has been verified against an older compiler.
