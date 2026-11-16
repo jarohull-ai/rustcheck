@@ -19,6 +19,12 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+mod deps;
+
+/// Where resolved crate artifacts are cached
+/// (`$XDG_CACHE_HOME/rustcheck`, `~/.cache/rustcheck` or `$RUSTCHECK_CACHE_DIR`).
+pub use deps::cache_root as deps_cache_dir;
+
 /// Default wall-clock budget for one compilation.
 pub const DEFAULT_TIMEOUT_MS: u64 = 3000;
 
@@ -64,6 +70,9 @@ pub struct CheckOptions {
     /// spawning, filesystem destruction, unbounded loops).
     pub guard: bool,
     pub crate_type: CrateType,
+    /// Registry crates the snippet uses, as `--dep` specs: `serde`,
+    /// `serde-json@1.0`. Empty means std-only, which needs no Cargo at all.
+    pub deps: Vec<String>,
 }
 
 impl Default for CheckOptions {
@@ -75,6 +84,7 @@ impl Default for CheckOptions {
             timeout_ms: DEFAULT_TIMEOUT_MS,
             guard: false,
             crate_type: CrateType::Lib,
+            deps: Vec::new(),
         }
     }
 }
@@ -127,6 +137,28 @@ impl CheckReport {
             "pass"
         } else {
             "fail"
+        }
+    }
+
+    /// Exit code for the CLI, following the documented taxonomy:
+    /// 0 pass, 1 the code is broken, 2 policy guard, 3 timeout,
+    /// 4 the tool could not do its job (no rustc, no bwrap when required,
+    /// dependencies that would not resolve, unreadable input).
+    ///
+    /// A harness cares about that last distinction: "the model wrote bad
+    /// code" and "the verifier is broken" must not look the same.
+    pub fn cli_exit_code(&self) -> u8 {
+        const TOOLING: [&str; 5] = ["E_NO_RUSTC", "E_NO_SANDBOX", "E_NO_CARGO", "E_DEPS", "E_BAD_DEP"];
+        if self.safety_violation.is_some() {
+            2
+        } else if self.timed_out {
+            3
+        } else if self.error_codes.iter().any(|code| TOOLING.contains(&code.as_str())) {
+            4
+        } else if self.success {
+            0
+        } else {
+            1
         }
     }
 }
@@ -208,6 +240,38 @@ pub fn check_full(code: &str, opts: &CheckOptions) -> (CheckReport, Vec<Suggesti
         }
     }
 
+    // External crates need Cargo to build their rlibs before rustc can see
+    // them. Failure here is a tooling problem, not a verdict on the code.
+    let dep_env = if opts.deps.is_empty() {
+        None
+    } else {
+        match deps::resolve_specs(&opts.deps, &opts.edition) {
+            Ok(env) => Some(env),
+            Err((code, message)) => {
+                return (
+                    CheckReport {
+                        success: false,
+                        exit_code: -96,
+                        duration_ms: start.elapsed().as_secs_f64() * 1000.0,
+                        sandbox: "none".to_string(),
+                        timed_out: false,
+                        safety_violation: None,
+                        error_codes: vec![code.to_string()],
+                        errors: vec![Diagnostic {
+                            level: "error".to_string(),
+                            code: Some(code.to_string()),
+                            message,
+                            line: None,
+                            column: None,
+                        }],
+                        stderr: String::new(),
+                    },
+                    Vec::new(),
+                );
+            }
+        }
+    };
+
     let rmeta = temp_rmeta_path();
     let use_bwrap = match opts.sandbox {
         Sandbox::Off => false,
@@ -259,8 +323,17 @@ pub fn check_full(code: &str, opts: &CheckOptions) -> (CheckReport, Vec<Suggesti
             .arg("/dev")
             .arg("--setenv")
             .arg("PATH")
-            .arg("/usr/bin:/bin")
-            .arg("rustc");
+            .arg("/usr/bin:/bin");
+
+        // Dependency artifacts live in the user's cache, outside the sandbox
+        // root. Bind exactly those directories, read-only, and nothing else.
+        if let Some(env) = &dep_env {
+            for dir in &env.lib_dirs {
+                c.arg("--ro-bind").arg(dir).arg(dir);
+            }
+        }
+
+        c.arg("rustc");
         c
     } else {
         Command::new("rustc")
@@ -276,6 +349,15 @@ pub fn check_full(code: &str, opts: &CheckOptions) -> (CheckReport, Vec<Suggesti
         .arg(&rmeta)
         .arg(format!("--edition={}", opts.edition))
         .arg("--error-format=json");
+
+    if let Some(env) = &dep_env {
+        for dir in &env.lib_dirs {
+            cmd.arg("-L").arg(format!("dependency={}", dir.display()));
+        }
+        for (name, path) in &env.externs {
+            cmd.arg("--extern").arg(format!("{name}={}", path.display()));
+        }
+    }
 
     if opts.deny_warnings {
         cmd.arg("-D").arg("warnings");

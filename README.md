@@ -24,6 +24,9 @@ the four things an agent loop needs:
    large diagnostic dump cannot block the child process.
 4. **Structured diagnostics** — `--json` returns error codes, levels and
    line/column, parsed from rustc's own JSON stream instead of regex over text.
+5. **Dependencies** — `--dep serde` builds the crate's rlibs with Cargo once,
+   caches them, and passes them to `rustc` as `--extern`, so snippets that use
+   the registry are type-checkable without a project of their own.
 
 ## Install
 
@@ -87,15 +90,49 @@ Exit codes: `0` pass, `1` compile error, `2` policy guard rejection,
 `64` rather than clap's default `2`, so a script can tell "the code broke the
 policy" from "you called the tool wrong".
 
+## External crates
+
+Without `--dep` a snippet is checked against `std` only: `use serde_json::json;`
+fails with `E0433`, because a bare `rustc` has no rlib to point at.
+
+```bash
+# one crate, any published version
+echo 'use serde_json::json; pub fn f() -> serde_json::Value { json!({}) }' \
+  | rustcheck check --dep serde_json@1
+
+# several crates, with a test harness
+rustcheck check --dep tokio@1 --dep serde@1 --crate-type test solution.rs
+
+# repair a snippet that uses a crate
+echo 'use serde_json::Value; pub fn n(v: &Value) -> u16 { v["a"].as_u64().unwrap_or(0) }' \
+  | rustcheck fix --dep serde_json@1
+```
+
+The first run creates a throwaway Cargo project under `~/.cache/rustcheck/`
+(`$XDG_CACHE_HOME`, or `$RUSTCHECK_CACHE_DIR` to override), builds the requested
+crates once, and records where the artifacts landed. Later runs only read that
+manifest, so the compiler stays the slow step: ~43 ms with `serde_json` in
+scope versus ~36 ms for a std-only snippet. `--dep name@1.2` pins a version;
+`@` and `=` are both accepted, and `name` alone means any version.
+
+Cargo runs outside the sandbox because it has to reach the registry. The
+snippet never does: `rustc` still runs under `bwrap`, with only the artifact
+directories bound in, read-only.
+
+Limits worth knowing before you rely on it:
+
+- **Registry crates only** — `path:` and `git:` dependencies are rejected
+  rather than half-supported.
+- **One source file** — `mod foo;` pointing at another file will not resolve.
+- **Type checking is not correctness** — code that compiles can still be wrong.
+- A dependency that will not resolve is reported as `E_DEPS` with exit code
+  `4`: the tool could not do its job, which is not the same as bad code.
+
 ## Policy guard
 
 `--guard` is off by default because legitimate Rust uses `unsafe` and I/O.
 Enable it only for untrusted snippets that are supposed to stay pure. It is a
 coarse filter, not a security boundary — the sandbox is the boundary.
-
-## Licence
-
-MIT OR Apache-2.0
 
 ## Licence
 

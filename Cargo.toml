@@ -1,6 +1,6 @@
 [package]
 name = "rustcheck"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Sandboxed Rust compile verification for LLM-generated code: structured diagnostics, hard timeouts, bwrap isolation."
 license = "MIT"

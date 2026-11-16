@@ -54,6 +54,11 @@ enum Cmd {
         /// Crate type to build metadata for (`test` type-checks #[test] harnesses).
         #[arg(long, value_parser = ["lib", "bin", "test"], default_value = "lib")]
         crate_type: String,
+
+        /// Registry crate the snippet uses: `--dep serde` or
+        /// `--dep serde-json@1.0`. Repeat for several crates.
+        #[arg(long = "dep", value_name = "SPEC")]
+        deps: Vec<String>,
     },
 
     /// Apply the compiler's own suggestions until the code type-checks.
@@ -76,6 +81,11 @@ enum Cmd {
         /// Treat warnings as errors (-D warnings).
         #[arg(long)]
         deny_warnings: bool,
+
+        /// Registry crate the snippet uses: `--dep serde` or
+        /// `--dep serde-json@1.0`. Repeat for several crates.
+        #[arg(long = "dep", value_name = "SPEC")]
+        deps: Vec<String>,
 
         /// How many repair rounds to attempt.
         #[arg(long, default_value_t = 5)]
@@ -135,6 +145,7 @@ fn main() -> ExitCode {
             require_sandbox,
             timeout_ms,
             crate_type,
+            deps,
         } => {
             let code = match read_code(&file) {
                 Ok(c) => c,
@@ -163,6 +174,7 @@ fn main() -> ExitCode {
                     "test" => CrateType::Test,
                     _ => CrateType::Lib,
                 },
+                deps,
             };
 
             let report = check(&code, &opts);
@@ -199,6 +211,11 @@ fn main() -> ExitCode {
                         _ => "-".to_string(),
                     };
                     println!("  [{code}] {loc}: {}", diag.message.lines().next().unwrap_or(""));
+                    // Tooling errors (E_DEPS, E_NO_CARGO) carry the whole Cargo
+                    // or driver message; truncating it hides the actual cause.
+                    for line in diag.message.lines().skip(1).take(8) {
+                        println!("      {line}");
+                    }
                 }
                 if report.errors.is_empty() && !report.stderr.trim().is_empty() {
                     for line in report.stderr.lines().take(10) {
@@ -207,15 +224,7 @@ fn main() -> ExitCode {
                 }
             }
 
-            if report.safety_violation.is_some() {
-                ExitCode::from(2)
-            } else if report.timed_out {
-                ExitCode::from(3)
-            } else if report.success {
-                ExitCode::SUCCESS
-            } else {
-                ExitCode::from(1)
-            }
+            ExitCode::from(report.cli_exit_code())
         }
 
         Cmd::Fix {
@@ -224,6 +233,7 @@ fn main() -> ExitCode {
             json,
             edition,
             deny_warnings,
+            deps,
             max_rounds,
             timeout_ms,
             no_sandbox,
@@ -243,6 +253,7 @@ fn main() -> ExitCode {
                 timeout_ms,
                 guard: false,
                 crate_type: CrateType::Lib,
+                deps,
             };
 
             let outcome = fix(&code, &opts, max_rounds);
@@ -284,11 +295,7 @@ fn main() -> ExitCode {
                 }
             }
 
-            if outcome.report.success {
-                ExitCode::SUCCESS
-            } else {
-                ExitCode::from(1)
-            }
+            ExitCode::from(outcome.report.cli_exit_code())
         }
 
         Cmd::Doctor => {
@@ -307,6 +314,15 @@ fn main() -> ExitCode {
                 }
                 _ => println!("bwrap:  not installed (checks run unsandboxed)"),
             }
+
+            let cargo = std::process::Command::new("cargo").arg("--version").output();
+            match cargo {
+                Ok(out) if out.status.success() => {
+                    println!("cargo:  {} (needed for --dep)", String::from_utf8_lossy(&out.stdout).trim());
+                }
+                _ => println!("cargo:  NOT FOUND (--dep is unavailable)"),
+            }
+            println!("deps cache: {}", rustcheck::deps_cache_dir().display());
 
             let canary = check("pub fn canary() -> u8 { 0 }", &CheckOptions::default());
             println!(
