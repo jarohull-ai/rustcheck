@@ -38,6 +38,9 @@ pub enum Sandbox {
 pub enum CrateType {
     Lib,
     Bin,
+    /// Build as a test harness (`rustc --test`), so `#[test]` functions and
+    /// the harness around them are type-checked too.
+    Test,
 }
 
 impl CrateType {
@@ -45,6 +48,7 @@ impl CrateType {
         match self {
             CrateType::Lib => "lib",
             CrateType::Bin => "bin",
+            CrateType::Test => "test",
         }
     }
 }
@@ -83,6 +87,18 @@ pub struct Diagnostic {
     pub message: String,
     pub line: Option<u32>,
     pub column: Option<u32>,
+}
+
+/// A machine-applicable edit proposed by the compiler.
+///
+/// Byte offsets refer to the source that produced this report, so they are
+/// only valid for that exact string.
+#[derive(Debug, Clone, Serialize)]
+pub struct Suggestion {
+    pub byte_start: u32,
+    pub byte_end: u32,
+    pub replacement: String,
+    pub applicability: String,
 }
 
 /// Outcome of a verification run.
@@ -162,11 +178,17 @@ fn spawn_reader<T: Read + Send + 'static>(mut pipe: T) -> std::thread::JoinHandl
 
 /// Compile `code` and report the result. Never panics on compiler output.
 pub fn check(code: &str, opts: &CheckOptions) -> CheckReport {
+    check_full(code, opts).0
+}
+
+/// Like [`check`], but also returns the edits rustc proposed — the input for
+/// [`apply_suggestions`] and [`fix`].
+pub fn check_full(code: &str, opts: &CheckOptions) -> (CheckReport, Vec<Suggestion>) {
     let start = Instant::now();
 
     if opts.guard {
         if let Some(violation) = guard_violation(code) {
-            return CheckReport {
+            return (CheckReport {
                 success: false,
                 exit_code: -99,
                 duration_ms: start.elapsed().as_secs_f64() * 1000.0,
@@ -182,7 +204,7 @@ pub fn check(code: &str, opts: &CheckOptions) -> CheckReport {
                     column: None,
                 }],
                 stderr: String::new(),
-            };
+            }, Vec::new());
         }
     }
 
@@ -194,7 +216,7 @@ pub fn check(code: &str, opts: &CheckOptions) -> CheckReport {
     };
 
     if matches!(opts.sandbox, Sandbox::Require) && !use_bwrap {
-        return CheckReport {
+        return (CheckReport {
             success: false,
             exit_code: -98,
             duration_ms: start.elapsed().as_secs_f64() * 1000.0,
@@ -210,7 +232,7 @@ pub fn check(code: &str, opts: &CheckOptions) -> CheckReport {
                 column: None,
             }],
             stderr: String::new(),
-        };
+        }, Vec::new());
     }
 
     let mut cmd = if use_bwrap {
@@ -244,9 +266,12 @@ pub fn check(code: &str, opts: &CheckOptions) -> CheckReport {
         Command::new("rustc")
     };
 
-    cmd.arg("--crate-type")
-        .arg(opts.crate_type.as_str())
-        .arg("--emit=metadata")
+    if opts.crate_type == CrateType::Test {
+        cmd.arg("--test");
+    } else {
+        cmd.arg("--crate-type").arg(opts.crate_type.as_str());
+    }
+    cmd.arg("--emit=metadata")
         .arg("-o")
         .arg(&rmeta)
         .arg(format!("--edition={}", opts.edition))
@@ -264,7 +289,7 @@ pub fn check(code: &str, opts: &CheckOptions) -> CheckReport {
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
-            return CheckReport {
+            return (CheckReport {
                 success: false,
                 exit_code: -97,
                 duration_ms: start.elapsed().as_secs_f64() * 1000.0,
@@ -280,7 +305,7 @@ pub fn check(code: &str, opts: &CheckOptions) -> CheckReport {
                     column: None,
                 }],
                 stderr: String::new(),
-            };
+            }, Vec::new());
         }
     };
 
@@ -324,7 +349,7 @@ pub fn check(code: &str, opts: &CheckOptions) -> CheckReport {
     let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
 
     if timed_out {
-        return CheckReport {
+        return (CheckReport {
             success: false,
             exit_code: -1,
             duration_ms,
@@ -343,10 +368,10 @@ pub fn check(code: &str, opts: &CheckOptions) -> CheckReport {
                 column: None,
             }],
             stderr,
-        };
+        }, Vec::new());
     }
 
-    let (diagnostics, rendered) = parse_diagnostics(&stderr);
+    let (diagnostics, rendered, suggestions) = parse_diagnostics(&stderr);
     let mut error_codes: Vec<String> = Vec::new();
     for d in &diagnostics {
         if d.level == "error" {
@@ -387,7 +412,7 @@ pub fn check(code: &str, opts: &CheckOptions) -> CheckReport {
         stderr_text = format!("{stderr_text}\n{stdout}");
     }
 
-    CheckReport {
+    let report = CheckReport {
         success,
         exit_code: status_code.unwrap_or(-1),
         duration_ms,
@@ -397,13 +422,82 @@ pub fn check(code: &str, opts: &CheckOptions) -> CheckReport {
         error_codes,
         errors,
         stderr: stderr_text,
+    };
+    (report, suggestions)
+}
+
+/// Apply rustc's machine-applicable suggestions to `code`.
+///
+/// Edits are applied from the end of the source backwards so earlier offsets
+/// stay valid; overlapping edits are skipped. Returns the rewritten source and
+/// how many edits were applied.
+pub fn apply_suggestions(code: &str, suggestions: &[Suggestion]) -> (String, usize) {
+    let mut edits: Vec<&Suggestion> = suggestions
+        .iter()
+        .filter(|s| s.applicability == "MachineApplicable")
+        .filter(|s| {
+            let (end, start) = (s.byte_end as usize, s.byte_start as usize);
+            end <= code.len() && start <= end && code.is_char_boundary(start) && code.is_char_boundary(end)
+        })
+        .collect();
+    edits.sort_by_key(|s| std::cmp::Reverse(s.byte_start));
+
+    let mut out = code.to_string();
+    let mut applied = 0usize;
+    let mut boundary = usize::MAX;
+
+    for edit in edits {
+        let (start, end) = (edit.byte_start as usize, edit.byte_end as usize);
+        if end > boundary {
+            continue;
+        }
+        out.replace_range(start..end, &edit.replacement);
+        boundary = start;
+        applied += 1;
     }
+
+    (out, applied)
+}
+
+/// Result of an iterative repair attempt.
+#[derive(Debug, Clone)]
+pub struct FixOutcome {
+    pub code: String,
+    pub report: CheckReport,
+    pub applied: usize,
+    pub rounds: usize,
+}
+
+/// Compile, apply the compiler's own suggestions, repeat.
+///
+/// This repairs purely mechanical defects (type conversions, missing `mut`,
+/// wrong argument order) without any model in the loop.
+pub fn fix(code: &str, opts: &CheckOptions, max_rounds: usize) -> FixOutcome {
+    let mut current = code.to_string();
+    let mut applied_total = 0usize;
+    let mut rounds = 0usize;
+    let mut report = check(&current, opts);
+
+    while !report.success && rounds < max_rounds {
+        let (_, suggestions) = check_full(&current, opts);
+        let (next, applied) = apply_suggestions(&current, &suggestions);
+        if applied == 0 || next == current {
+            break;
+        }
+        current = next;
+        applied_total += applied;
+        rounds += 1;
+        report = check(&current, opts);
+    }
+
+    FixOutcome { code: current, report, applied: applied_total, rounds }
 }
 
 /// Parse rustc's `--error-format=json` stream, ignoring non-JSON noise.
-fn parse_diagnostics(stderr: &str) -> (Vec<Diagnostic>, String) {
+fn parse_diagnostics(stderr: &str) -> (Vec<Diagnostic>, String, Vec<Suggestion>) {
     let mut out = Vec::new();
     let mut rendered_parts: Vec<String> = Vec::new();
+    let mut suggestions: Vec<Suggestion> = Vec::new();
     for line in stderr.lines() {
         let line = line.trim();
         if !line.starts_with('{') {
@@ -450,9 +544,47 @@ fn parse_diagnostics(stderr: &str) -> (Vec<Diagnostic>, String) {
                 rendered_parts.push(r.to_string());
             }
         }
+        collect_suggestions(&msg, &mut suggestions);
         out.push(Diagnostic { level, code, message, line: line_no, column });
     }
-    (out, rendered_parts.join("\n"))
+    (out, rendered_parts.join("\n"), suggestions)
+}
+
+/// Collect machine-applicable edits from a diagnostic's spans and children.
+fn collect_suggestions(msg: &serde_json::Value, out: &mut Vec<Suggestion>) {
+    fn push_spans(node: &serde_json::Value, out: &mut Vec<Suggestion>) {
+        let Some(spans) = node.get("spans").and_then(|s| s.as_array()) else {
+            return;
+        };
+        for span in spans {
+            let Some(replacement) = span.get("suggested_replacement").and_then(|r| r.as_str()) else {
+                continue;
+            };
+            let applicability = span
+                .get("suggestion_applicability")
+                .and_then(|a| a.as_str())
+                .unwrap_or("Unspecified");
+            let (Some(byte_start), Some(byte_end)) = (
+                span.get("byte_start").and_then(|v| v.as_u64()),
+                span.get("byte_end").and_then(|v| v.as_u64()),
+            ) else {
+                continue;
+            };
+            out.push(Suggestion {
+                byte_start: byte_start as u32,
+                byte_end: byte_end as u32,
+                replacement: replacement.to_string(),
+                applicability: applicability.to_string(),
+            });
+        }
+    }
+
+    push_spans(msg, out);
+    if let Some(children) = msg.get("children").and_then(|c| c.as_array()) {
+        for child in children {
+            push_spans(child, out);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -493,5 +625,22 @@ mod tests {
         o.deny_warnings = true;
         let report = check("pub fn f() { let unused = 1; }", &o);
         assert!(!report.success);
+    }
+
+    #[test]
+    fn fix_repairs_type_mismatch_without_a_model() {
+        let outcome = fix("pub fn add(a: i32, b: i32) -> u16 { a + b }", &opts(), 3);
+        assert!(outcome.report.success, "still broken: {}", outcome.report.stderr);
+        assert!(outcome.applied > 0, "no edit applied");
+        assert!(outcome.code.contains("try_into"), "unexpected result: {}", outcome.code);
+    }
+
+    #[test]
+    fn test_harness_is_type_checked() {
+        let mut o = opts();
+        o.crate_type = CrateType::Test;
+        let code = "pub fn add(a: i32, b: i32) -> i32 { a + b }\n#[test]\nfn t() { assert_eq!(add(1, 2), 3); }";
+        let report = check(code, &o);
+        assert!(report.success, "stderr: {}", report.stderr);
     }
 }

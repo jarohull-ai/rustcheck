@@ -43,7 +43,18 @@ rustcheck check --json --require-sandbox < generated.rs
 
 # is this machine able to verify at all?
 rustcheck doctor
+
+# repair mechanical errors using the compiler's own suggestions (no model)
+rustcheck fix broken.rs --write
+
+# type-check a solution together with a #[test] harness
+rustcheck check --crate-type test solution_with_tests.rs
 ```
+
+The `fix` loop applies only edits rustc marks `MachineApplicable`, from the end
+of the source backwards so offsets stay valid, and stops when it runs out of
+suggestions. It repairs conversions, missing `mut`, wrong argument order — the
+things a model gets wrong mechanically. It cannot repair design mistakes.
 
 Example report:
 

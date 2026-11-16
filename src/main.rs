@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand};
-use rustcheck::{check, CheckOptions, CrateType, Sandbox};
+use rustcheck::{check, fix, CheckOptions, CrateType, Sandbox};
 use std::io::Read;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -53,6 +53,40 @@ enum Cmd {
         /// Crate type to build metadata for.
         #[arg(long, value_parser = ["lib", "bin"], default_value = "lib")]
         crate_type: String,
+    },
+
+    /// Apply the compiler's own suggestions until the code type-checks.
+    Fix {
+        /// Path to a .rs file. Omit to read stdin.
+        file: Option<PathBuf>,
+
+        /// Overwrite the input file instead of printing to stdout.
+        #[arg(long)]
+        write: bool,
+
+        /// Machine-readable report plus the repaired source.
+        #[arg(long)]
+        json: bool,
+
+        /// Rust edition to compile with.
+        #[arg(long, default_value = "2021")]
+        edition: String,
+
+        /// Treat warnings as errors (-D warnings).
+        #[arg(long)]
+        deny_warnings: bool,
+
+        /// How many repair rounds to attempt.
+        #[arg(long, default_value_t = 5)]
+        max_rounds: usize,
+
+        /// Wall-clock budget per compilation, in milliseconds.
+        #[arg(long, default_value_t = 3000)]
+        timeout_ms: u64,
+
+        /// Skip the bwrap sandbox even if it is installed.
+        #[arg(long)]
+        no_sandbox: bool,
     },
 
     /// Report toolchain and sandbox availability.
@@ -160,6 +194,79 @@ fn main() -> ExitCode {
             } else if report.timed_out {
                 ExitCode::from(3)
             } else if report.success {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::from(1)
+            }
+        }
+
+        Cmd::Fix {
+            file,
+            write,
+            json,
+            edition,
+            deny_warnings,
+            max_rounds,
+            timeout_ms,
+            no_sandbox,
+        } => {
+            let code = match read_code(&file) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("rustcheck: {e}");
+                    return ExitCode::from(4);
+                }
+            };
+
+            let opts = CheckOptions {
+                edition,
+                deny_warnings,
+                sandbox: if no_sandbox { Sandbox::Off } else { Sandbox::Auto },
+                timeout_ms,
+                guard: false,
+                crate_type: CrateType::Lib,
+            };
+
+            let outcome = fix(&code, &opts, max_rounds);
+
+            if json {
+                let payload = serde_json::json!({
+                    "success": outcome.report.success,
+                    "applied_edits": outcome.applied,
+                    "rounds": outcome.rounds,
+                    "code": outcome.code,
+                    "report": outcome.report,
+                });
+                match serde_json::to_string_pretty(&payload) {
+                    Ok(s) => println!("{s}"),
+                    Err(e) => {
+                        eprintln!("rustcheck: cannot serialize result: {e}");
+                        return ExitCode::from(4);
+                    }
+                }
+            } else {
+                eprintln!(
+                    "rustcheck: applied {} edit(s) in {} round(s) -> {}",
+                    outcome.applied,
+                    outcome.rounds,
+                    outcome.report.status()
+                );
+                if write {
+                    if let Some(path) = &file {
+                        if let Err(e) = std::fs::write(path, &outcome.code) {
+                            eprintln!("rustcheck: cannot write {}: {e}", path.display());
+                            return ExitCode::from(4);
+                        }
+                    } else {
+                        eprintln!("rustcheck: --write needs a file argument; printing instead");
+                        print!("{}", outcome.code);
+                    }
+                } else {
+                    print!("{}", outcome.code);
+                }
+            }
+
+            if outcome.report.success {
                 ExitCode::SUCCESS
             } else {
                 ExitCode::from(1)
