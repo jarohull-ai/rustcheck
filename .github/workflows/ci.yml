@@ -1,0 +1,21 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain
+        run: rustc --version && cargo --version
+
+      # --locked: the committed Cargo.lock is the one that gets tested.
+      # --all-targets: the binary and its helpers are type-checked too, not
+      # just the library the tests link against.
+      - name: Test
+        run: cargo test --locked --all-targets
