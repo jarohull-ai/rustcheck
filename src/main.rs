@@ -307,12 +307,13 @@ fn main() -> ExitCode {
                 _ => println!("rustc:  NOT FOUND (verification is impossible)"),
             }
 
-            let bwrap = std::process::Command::new("/usr/bin/bwrap").arg("--version").output();
-            match bwrap {
-                Ok(out) if out.status.success() => {
-                    println!("bwrap:  {}", String::from_utf8_lossy(&out.stdout).trim());
-                }
-                _ => println!("bwrap:  not installed (checks run unsandboxed)"),
+            match rustcheck::bwrap_status() {
+                (false, _) => println!("bwrap:  not installed (checks run unsandboxed)"),
+                (true, true) => println!("bwrap:  usable (checks run sandboxed)"),
+                (true, false) => println!(
+                    "bwrap:  installed but unusable — unprivileged user namespaces are blocked; \
+                     checks run unsandboxed"
+                ),
             }
 
             let cargo = std::process::Command::new("cargo").arg("--version").output();

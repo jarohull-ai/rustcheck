@@ -192,6 +192,54 @@ fn bwrap_available() -> bool {
     Path::new("/usr/bin/bwrap").exists()
 }
 
+/// Does `bwrap` actually work here, not just exist?
+///
+/// Installing `bwrap` is not enough: Ubuntu 23.10+ blocks unprivileged user
+/// namespaces through AppArmor, so the binary is present but every sandbox
+/// invocation dies in a few milliseconds. Treating that as "sandboxed" turns
+/// valid code into `fail`, which is the one failure mode a verifier must never
+/// have. Probe once per process with the same flags a real check uses.
+fn bwrap_usable() -> bool {
+    static PROBE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *PROBE.get_or_init(|| {
+        if !bwrap_available() {
+            return false;
+        }
+        let probe = Command::new("/usr/bin/bwrap")
+            .arg("--unshare-all")
+            .arg("--die-with-parent")
+            .arg("--ro-bind")
+            .arg("/usr")
+            .arg("/usr")
+            .arg("--ro-bind-try")
+            .arg("/lib")
+            .arg("/lib")
+            .arg("--ro-bind-try")
+            .arg("/lib64")
+            .arg("/lib64")
+            .arg("--ro-bind-try")
+            .arg("/bin")
+            .arg("/bin")
+            .arg("--tmpfs")
+            .arg("/tmp")
+            .arg("--proc")
+            .arg("/proc")
+            .arg("--dev")
+            .arg("/dev")
+            .arg("/usr/bin/true")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        matches!(probe, Ok(status) if status.success())
+    })
+}
+
+/// `(installed, usable)` — for `rustcheck doctor`, so the reason is visible.
+pub fn bwrap_status() -> (bool, bool) {
+    (bwrap_available(), bwrap_usable())
+}
+
 fn temp_rmeta_path() -> PathBuf {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -275,8 +323,7 @@ pub fn check_full(code: &str, opts: &CheckOptions) -> (CheckReport, Vec<Suggesti
     let rmeta = temp_rmeta_path();
     let use_bwrap = match opts.sandbox {
         Sandbox::Off => false,
-        Sandbox::Auto => bwrap_available(),
-        Sandbox::Require => bwrap_available(),
+        Sandbox::Auto | Sandbox::Require => bwrap_usable(),
     };
 
     if matches!(opts.sandbox, Sandbox::Require) && !use_bwrap {
@@ -291,7 +338,11 @@ pub fn check_full(code: &str, opts: &CheckOptions) -> (CheckReport, Vec<Suggesti
             errors: vec![Diagnostic {
                 level: "error".to_string(),
                 code: Some("E_NO_SANDBOX".to_string()),
-                message: "bwrap is required but not installed".to_string(),
+                message: if bwrap_available() {
+                    "bwrap is required but unusable here: it is installed, yet it cannot create a sandbox (unprivileged user namespaces are probably blocked). Run `rustcheck doctor` for details.".to_string()
+                } else {
+                    "bwrap is required but not installed".to_string()
+                },
                 line: None,
                 column: None,
             }],
@@ -715,6 +766,20 @@ mod tests {
         assert!(outcome.report.success, "still broken: {}", outcome.report.stderr);
         assert!(outcome.applied > 0, "no edit applied");
         assert!(outcome.code.contains("try_into"), "unexpected result: {}", outcome.code);
+    }
+
+    #[test]
+    fn valid_code_passes_whatever_the_sandbox_does() {
+        // Regression: a present-but-broken bwrap used to turn valid code into
+        // `fail` (exit 1) instead of running unsandboxed.
+        let report = check("pub fn ok() -> u8 { 1 }", &CheckOptions::default());
+        assert!(
+            report.success,
+            "sandbox: {}, codes: {:?}, stderr: {}",
+            report.sandbox,
+            report.error_codes,
+            report.stderr
+        );
     }
 
     #[test]
