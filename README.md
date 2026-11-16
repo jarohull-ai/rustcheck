@@ -134,6 +134,27 @@ Limits worth knowing before you rely on it:
 Enable it only for untrusted snippets that are supposed to stay pure. It is a
 coarse filter, not a security boundary — the sandbox is the boundary.
 
+## What the sandbox does and does not do
+
+`rustc` runs under `bwrap --unshare-all --die-with-parent`, with `/usr`, the
+C-library directories, the Rust toolchain and the dependency cache bound in
+read-only, a fresh `tmpfs` on `/tmp`, and no network. That matters for more than
+resource limits: a snippet can say `include_str!("/home/you/.ssh/id_rsa")`, and
+rustc would read it into a diagnostic that goes straight back to whoever is
+driving the loop. Paths outside the binds are invisible — verified:
+`include_str!("/etc/shadow")` fails with `ENOENT`.
+
+Whether the sandbox can work at all is probed by running `rustc --version`
+through it, once per process. `bwrap` can be installed and still be useless
+(blocked user namespaces), and a rustup toolchain can live outside the paths a
+naive sandbox exposes; either case would turn valid code into `fail`. In auto
+mode a broken sandbox means an unsandboxed run plus `sandbox: "none"` in the
+report; with `--require-sandbox` it is `E_NO_SANDBOX` and exit `4`.
+
+What it does not do: with `--dep`, Cargo fetches and builds dependencies on the
+host, outside the sandbox, because it needs the network. Named crates are
+therefore trusted; the snippet is not.
+
 ## Licence
 
 MIT — see `LICENSE`. Only the MIT text is shipped, so the manifest does not
