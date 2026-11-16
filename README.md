@@ -81,7 +81,9 @@ Example report:
 ```
 
 Exit codes: `0` pass, `1` compile error, `2` policy guard rejection,
-`3` timeout, `4` toolchain problem.
+`3` timeout, `4` toolchain problem, `64` bad command line. Usage errors return
+`64` rather than clap's default `2`, so a script can tell "the code broke the
+policy" from "you called the tool wrong".
 
 ## Policy guard
 

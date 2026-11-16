@@ -1,3 +1,4 @@
+use clap::error::ErrorKind;
 use clap::{Parser, Subcommand};
 use rustcheck::{check, fix, CheckOptions, CrateType, Sandbox};
 use std::io::Read;
@@ -50,8 +51,8 @@ enum Cmd {
         #[arg(long, default_value_t = 3000)]
         timeout_ms: u64,
 
-        /// Crate type to build metadata for.
-        #[arg(long, value_parser = ["lib", "bin"], default_value = "lib")]
+        /// Crate type to build metadata for (`test` type-checks #[test] harnesses).
+        #[arg(long, value_parser = ["lib", "bin", "test"], default_value = "lib")]
         crate_type: String,
     },
 
@@ -108,7 +109,20 @@ fn read_code(file: &Option<PathBuf>) -> Result<String, String> {
 }
 
 fn main() -> ExitCode {
-    let cli = Cli::parse();
+    // Parse by hand so a usage error cannot be confused with a policy-guard
+    // rejection: clap's default failure code is 2, which is our "safety".
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(err) => {
+            let kind = err.kind();
+            let _ = err.print();
+            return if matches!(kind, ErrorKind::DisplayHelp | ErrorKind::DisplayVersion) {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::from(64)
+            };
+        }
+    };
 
     match cli.cmd {
         Cmd::Check {
@@ -144,7 +158,11 @@ fn main() -> ExitCode {
                 sandbox,
                 timeout_ms,
                 guard,
-                crate_type: if crate_type == "bin" { CrateType::Bin } else { CrateType::Lib },
+                crate_type: match crate_type.as_str() {
+                    "bin" => CrateType::Bin,
+                    "test" => CrateType::Test,
+                    _ => CrateType::Lib,
+                },
             };
 
             let report = check(&code, &opts);
