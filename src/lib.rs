@@ -192,46 +192,111 @@ fn bwrap_available() -> bool {
     Path::new("/usr/bin/bwrap").exists()
 }
 
-/// Does `bwrap` actually work here, not just exist?
+/// Absolute path of `rustc` as this process would run it.
+fn rustc_path() -> Option<PathBuf> {
+    let paths = std::env::var_os("PATH")?;
+    std::env::split_paths(&paths)
+        .map(|dir| dir.join("rustc"))
+        .find(|candidate| candidate.is_file())
+}
+
+/// Bind `dir` read-only unless it is already covered by a broader bind.
+fn bind_ro(cmd: &mut Command, dir: &Path, bound: &mut Vec<PathBuf>) {
+    if !dir.exists() || bound.iter().any(|seen| seen == dir) {
+        return;
+    }
+    cmd.arg("--ro-bind").arg(dir).arg(dir);
+    bound.push(dir.to_path_buf());
+}
+
+/// The sandbox prefix shared by the probe and by real checks.
 ///
-/// Installing `bwrap` is not enough: Ubuntu 23.10+ blocks unprivileged user
-/// namespaces through AppArmor, so the binary is present but every sandbox
-/// invocation dies in a few milliseconds. Treating that as "sandboxed" turns
-/// valid code into `fail`, which is the one failure mode a verifier must never
-/// have. Probe once per process with the same flags a real check uses.
+/// Only `/usr`, the C-library directories, the Rust toolchain and the given
+/// extra directories are readable. Binding the whole filesystem would be
+/// simpler, but a snippet can write `include_str!("/home/you/.ssh/id_rsa")`
+/// and rustc would read it straight into a diagnostic — the compiler must not
+/// see what the snippet has no business seeing.
+///
+/// A rustup-installed `rustc` lives in `$CARGO_HOME/bin` and needs
+/// `$RUSTUP_HOME`; a distro `rustc` lives in `/usr/bin` and needs nothing.
+/// Getting this wrong silently breaks every check on machines with rustup, so
+/// the paths are resolved from the toolchain rather than assumed.
+fn bwrap_command(extra: &[PathBuf]) -> Command {
+    let mut cmd = Command::new("/usr/bin/bwrap");
+    cmd.arg("--unshare-all")
+        .arg("--die-with-parent")
+        .arg("--ro-bind")
+        .arg("/usr")
+        .arg("/usr")
+        .arg("--ro-bind-try")
+        .arg("/lib")
+        .arg("/lib")
+        .arg("--ro-bind-try")
+        .arg("/lib64")
+        .arg("/lib64")
+        .arg("--ro-bind-try")
+        .arg("/bin")
+        .arg("/bin")
+        .arg("--tmpfs")
+        .arg("/tmp")
+        .arg("--proc")
+        .arg("/proc")
+        .arg("--dev")
+        .arg("/dev");
+
+    let mut bound: Vec<PathBuf> = vec![
+        PathBuf::from("/usr"),
+        PathBuf::from("/lib"),
+        PathBuf::from("/lib64"),
+        PathBuf::from("/bin"),
+    ];
+
+    let mut path_entries: Vec<PathBuf> = vec![PathBuf::from("/usr/bin"), PathBuf::from("/bin")];
+    if let Some(rustc) = rustc_path() {
+        if let Some(dir) = rustc.parent() {
+            bind_ro(&mut cmd, dir, &mut bound);
+            path_entries.insert(0, dir.to_path_buf());
+        }
+    }
+    let rustup_home = std::env::var_os("RUSTUP_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".rustup")));
+    if let Some(dir) = rustup_home {
+        bind_ro(&mut cmd, &dir, &mut bound);
+    }
+    for dir in extra {
+        bind_ro(&mut cmd, dir, &mut bound);
+    }
+
+    // Keep the sandbox PATH equal to the host's toolchain location, so the
+    // `rustc` the caller would run is the `rustc` that runs here.
+    let path_value = std::env::join_paths(path_entries)
+        .unwrap_or_else(|_| std::ffi::OsString::from("/usr/bin:/bin"));
+    cmd.arg("--setenv").arg("PATH").arg(path_value);
+    cmd
+}
+
+/// Does the sandbox actually work here — not just `bwrap` exist?
+///
+/// Two ways it lies: unprivileged user namespaces can be blocked
+/// (Ubuntu 23.10+ via AppArmor), and the toolchain can sit outside the paths
+/// the sandbox exposes (rustup). Either one turns valid code into `fail`, the
+/// one answer a verifier must never give, so probe by running the real
+/// compiler through the real sandbox once per process.
 fn bwrap_usable() -> bool {
     static PROBE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *PROBE.get_or_init(|| {
         if !bwrap_available() {
             return false;
         }
-        let probe = Command::new("/usr/bin/bwrap")
-            .arg("--unshare-all")
-            .arg("--die-with-parent")
-            .arg("--ro-bind")
-            .arg("/usr")
-            .arg("/usr")
-            .arg("--ro-bind-try")
-            .arg("/lib")
-            .arg("/lib")
-            .arg("--ro-bind-try")
-            .arg("/lib64")
-            .arg("/lib64")
-            .arg("--ro-bind-try")
-            .arg("/bin")
-            .arg("/bin")
-            .arg("--tmpfs")
-            .arg("/tmp")
-            .arg("--proc")
-            .arg("/proc")
-            .arg("--dev")
-            .arg("/dev")
-            .arg("/usr/bin/true")
+        let status = bwrap_command(&[])
+            .arg("rustc")
+            .arg("--version")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
-        matches!(probe, Ok(status) if status.success())
+        matches!(status, Ok(status) if status.success())
     })
 }
 
@@ -350,40 +415,14 @@ pub fn check_full(code: &str, opts: &CheckOptions) -> (CheckReport, Vec<Suggesti
         }, Vec::new());
     }
 
+    // Dependency artifacts live outside the sandbox root (the user's cache),
+    // so they are bound in explicitly — read-only, nothing else.
+    let dep_dirs: &[PathBuf] = dep_env
+        .as_ref()
+        .map(|env| env.lib_dirs.as_slice())
+        .unwrap_or(&[]);
     let mut cmd = if use_bwrap {
-        let mut c = Command::new("/usr/bin/bwrap");
-        c.arg("--unshare-all")
-            .arg("--die-with-parent")
-            .arg("--ro-bind")
-            .arg("/usr")
-            .arg("/usr")
-            .arg("--ro-bind-try")
-            .arg("/lib")
-            .arg("/lib")
-            .arg("--ro-bind-try")
-            .arg("/lib64")
-            .arg("/lib64")
-            .arg("--ro-bind-try")
-            .arg("/bin")
-            .arg("/bin")
-            .arg("--tmpfs")
-            .arg("/tmp")
-            .arg("--proc")
-            .arg("/proc")
-            .arg("--dev")
-            .arg("/dev")
-            .arg("--setenv")
-            .arg("PATH")
-            .arg("/usr/bin:/bin");
-
-        // Dependency artifacts live in the user's cache, outside the sandbox
-        // root. Bind exactly those directories, read-only, and nothing else.
-        if let Some(env) = &dep_env {
-            for dir in &env.lib_dirs {
-                c.arg("--ro-bind").arg(dir).arg(dir);
-            }
-        }
-
+        let mut c = bwrap_command(dep_dirs);
         c.arg("rustc");
         c
     } else {
